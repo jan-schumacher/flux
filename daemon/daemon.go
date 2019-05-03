@@ -769,13 +769,18 @@ func policyEventTypes(u policy.Update) []string {
 	return result
 }
 
-// latestValidRevision returns the latest valid revision for the
-// configured branch when the verification of GPG signatures for Git
-// is enabled _or_ the HEAD revision of the configured branch when it
-// is not. Signature validation happens for commits between the sync
-// tag revision and the HEAD, after the signature of the sync tag
-// itself has been validated, as the branch can not be trusted when
-// the tag originates from an unknown source.
+// latestValidRevision returns the HEAD of the configured branch if it
+// has a valid signature, or the SHA of the latest valid commit it
+// could find plus the invalid commit thereafter.
+//
+// Signature validation happens for commits between the revision of the
+// sync tag and the HEAD, after the signature of the sync tag itself
+// has been validated, as the branch can not be trusted when the tag
+// originates from an unknown source.
+//
+// In case the signature of the tag can not be verified, or it points
+// towards a revision we can not get a commit range for, it returns an
+// error.
 func latestValidRevision(ctx context.Context, repo *git.Repo, gitConfig git.Config) (string, git.Commit, error) {
 	var invalidCommit = git.Commit{}
 	newRevision, err := repo.Revision(ctx, "heads/"+gitConfig.Branch)
