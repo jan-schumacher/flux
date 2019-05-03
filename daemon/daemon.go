@@ -356,7 +356,7 @@ func (d *Daemon) sync() jobFunc {
 		var latestVerifiedRev string
 		if latestVerifiedRev, _, err = latestValidRevision(ctx, d.Repo, d.GitConfig); err != nil {
 			return result, err
-		} else if head, err := d.Repo.Revision(ctx, "heads/"+d.GitConfig.Branch); err != nil {
+		} else if head, err := d.Repo.BranchHead(ctx); err != nil {
 			return result, err
 		} else if head != latestVerifiedRev {
 			result.Revision = latestVerifiedRev
@@ -783,7 +783,7 @@ func policyEventTypes(u policy.Update) []string {
 // error.
 func latestValidRevision(ctx context.Context, repo *git.Repo, gitConfig git.Config) (string, git.Commit, error) {
 	var invalidCommit = git.Commit{}
-	newRevision, err := repo.Revision(ctx, "heads/"+gitConfig.Branch)
+	newRevision, err := repo.BranchHead(ctx)
 	if err != nil {
 		return "", invalidCommit, err
 	}
