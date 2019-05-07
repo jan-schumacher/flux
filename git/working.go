@@ -5,7 +5,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"time"
 )
 
 var (
@@ -22,10 +21,8 @@ type Config struct {
 	UserName         string
 	UserEmail        string
 	SigningKey       string
-	VerifySignatures bool
 	SetAuthor        bool
 	SkipMessage      string
-	Timeout          time.Duration
 }
 
 // Checkout is a local working clone of the remote repo. It is

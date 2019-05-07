@@ -36,7 +36,7 @@ type changeSet struct {
 // Sync starts the synchronization of the cluster with git.
 func (d *Daemon) Sync(ctx context.Context, started time.Time, revision string, syncTag SyncTag) error {
 	// Checkout a working clone used for this sync
-	ctxt, cancel := context.WithTimeout(ctx, d.GitConfig.Timeout)
+	ctxt, cancel := context.WithTimeout(ctx, d.GitTimeout)
 	working, err := d.Repo.Clone(ctxt, d.GitConfig)
 	if err != nil {
 		return err
@@ -52,7 +52,7 @@ func (d *Daemon) Sync(ctx context.Context, started time.Time, revision string, s
 	}
 
 	// Retrieve change set of commits we need to sync
-	c, err := getChangeSet(ctx, working, d.Repo, d.GitConfig.Timeout, d.GitConfig.Paths)
+	c, err := getChangeSet(ctx, working, d.Repo, d.GitTimeout, d.GitConfig.Paths)
 	if err != nil {
 		return err
 	}
@@ -65,18 +65,18 @@ func (d *Daemon) Sync(ctx context.Context, started time.Time, revision string, s
 	}
 
 	// Determine what resources changed during the sync
-	changedResources, err := getChangedResources(ctx, c, d.GitConfig, working, d.Manifests, resources)
+	changedResources, err := getChangedResources(ctx, c, d.GitTimeout, working, d.Manifests, resources)
 	serviceIDs := flux.ResourceIDSet{}
 	for _, r := range changedResources {
 		serviceIDs.Add([]flux.ResourceID{r.ResourceID()})
 	}
 
 	// Retrieve git notes and collect events from them
-	notes, err := getNotes(ctx, d.GitConfig.Timeout, working)
+	notes, err := getNotes(ctx, d.GitTimeout, working)
 	if err != nil {
 		return err
 	}
-	noteEvents, includesEvents, err := collectNoteEvents(ctx, c, notes, d.GitConfig.Timeout, working, started, d.Logger)
+	noteEvents, includesEvents, err := collectNoteEvents(ctx, c, notes, d.GitTimeout, working, started, d.Logger)
 	if err != nil {
 		return err
 	}
@@ -97,11 +97,11 @@ func (d *Daemon) Sync(ctx context.Context, started time.Time, revision string, s
 
 	// Move sync tag
 	if c.newTagRev != c.oldTagRev {
-		if err := moveSyncTag(ctx, c, d.GitConfig.Timeout, working); err != nil {
+		if err := moveSyncTag(ctx, c, d.GitTimeout, working); err != nil {
 			return err
 		}
 		syncTag.SetRevision(c.oldTagRev, c.newTagRev)
-		if err := refresh(ctx, d.GitConfig.Timeout, d.Repo); err != nil {
+		if err := refresh(ctx, d.GitTimeout, d.Repo); err != nil {
 			return err
 		}
 	}
@@ -167,13 +167,13 @@ func doSync(manifests cluster.Manifests, working *git.Checkout, clus cluster.Clu
 
 // getChangedResources calculates what resources are modified during
 // this sync.
-func getChangedResources(ctx context.Context, c changeSet, gitConfig git.Config, working *git.Checkout,
+func getChangedResources(ctx context.Context, c changeSet, timeout time.Duration, working *git.Checkout,
 	manifests cluster.Manifests, resources map[string]resource.Resource) (map[string]resource.Resource, error) {
 	if c.initialSync {
 		return resources, nil
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, gitConfig.Timeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	changedFiles, err := working.ChangedFiles(ctx, c.oldTagRev)
 	if err == nil && len(changedFiles) > 0 {
 		// We had some changed files, we're syncing a diff

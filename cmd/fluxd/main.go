@@ -492,10 +492,8 @@ func main() {
 		UserName:         *gitUser,
 		UserEmail:        *gitEmail,
 		SigningKey:       *gitSigningKey,
-		VerifySignatures: *gitVerifySignatures,
 		SetAuthor:        *gitSetAuthor,
 		SkipMessage:      *gitSkipMessage,
-		Timeout:          *gitTimeout,
 	}
 
 	repo := git.NewRepo(gitRemote, git.PollInterval(*gitPollInterval), git.Timeout(*gitTimeout), git.Branch(*gitBranch))
@@ -539,6 +537,8 @@ func main() {
 		LoopVars: &daemon.LoopVars{
 			SyncInterval:         *syncInterval,
 			RegistryPollInterval: *registryPollInterval,
+			GitTimeout:           *gitTimeout,
+			GitVerifySignatures:  *gitVerifySignatures,
 		},
 	}
 

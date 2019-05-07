@@ -236,7 +236,7 @@ func (d *Daemon) makeJobFromUpdate(update updateFunc) jobFunc {
 		var result job.Result
 		err := d.WithClone(ctx, func(working *git.Checkout) error {
 			var err error
-			if err = verifyWorkingRepo(ctx, d.Repo, working, d.GitConfig); err != nil {
+			if err = verifyWorkingRepo(ctx, d.Repo, working, d.GitConfig); d.GitVerifySignatures && err != nil {
 				return err
 			}
 			result, err = update(ctx, jobID, working, logger)
@@ -356,20 +356,24 @@ func (d *Daemon) sync() jobFunc {
 		if err != nil {
 			return result, err
 		}
-		var latestVerifiedRev string
-		if latestVerifiedRev, _, err = latestValidRevision(ctx, d.Repo, d.GitConfig); err != nil {
+		head, err := d.Repo.BranchHead(ctx)
+		if err != nil {
 			return result, err
-		} else if head, err := d.Repo.BranchHead(ctx); err != nil {
-			return result, err
-		} else if head != latestVerifiedRev {
-			result.Revision = latestVerifiedRev
-			return result, fmt.Errorf(
-				"The branch HEAD in the git repo is not verified, and fluxd is unable to sync to it. The last verified commit was %.8s. HEAD is %.8s.",
-				latestVerifiedRev,
-				head,
-			)
 		}
-		result.Revision = latestVerifiedRev
+		if d.GitVerifySignatures {
+			var latestValidRev string
+			if latestValidRev, _, err = latestValidRevision(ctx, d.Repo, d.GitConfig); err != nil {
+				return result, err
+			} else if head != latestValidRev {
+				result.Revision = latestValidRev
+				return result, fmt.Errorf(
+					"The branch HEAD in the git repo is not verified, and fluxd is unable to sync to it. The last verified commit was %.8s. HEAD is %.8s.",
+					latestValidRev,
+					head,
+				)
+			}
+		}
+		result.Revision = head
 		return result, err
 	}
 }
@@ -781,9 +785,6 @@ func latestValidRevision(ctx context.Context, repo *git.Repo, gitConfig git.Conf
 	newRevision, err := repo.BranchHead(ctx)
 	if err != nil {
 		return "", invalidCommit, err
-	}
-	if !gitConfig.VerifySignatures {
-		return newRevision, invalidCommit, err
 	}
 
 	// Validate tag and retrieve the revision it points to

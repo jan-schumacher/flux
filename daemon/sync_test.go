@@ -57,7 +57,6 @@ func daemon(t *testing.T) (*Daemon, func()) {
 		NotesRef:  gitNotesRef,
 		UserName:  gitUser,
 		UserEmail: gitEmail,
-		Timeout:   10 * time.Second,
 	}
 
 	manifests := kubernetes.NewManifests(alwaysDefault, log.NewLogfmtLogger(os.Stdout))
@@ -73,7 +72,7 @@ func daemon(t *testing.T) (*Daemon, func()) {
 		JobStatusCache: &job.StatusCache{Size: 100},
 		EventWriter:    events,
 		Logger:         log.NewLogfmtLogger(os.Stdout),
-		LoopVars:       &LoopVars{},
+		LoopVars:       &LoopVars{GitTimeout: timeout},
 	}
 	return d, func() {
 		close(shutdown)

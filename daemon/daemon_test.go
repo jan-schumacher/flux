@@ -678,7 +678,6 @@ func mockDaemon(t *testing.T) (*Daemon, func(), func(), *cluster.Mock, *mockEven
 		UserEmail: "example@example.com",
 		SyncTag:   "flux-test",
 		NotesRef:  "fluxtest",
-		Timeout:   timeout,
 	}
 
 	var k8s *cluster.Mock
@@ -746,7 +745,7 @@ func mockDaemon(t *testing.T) (*Daemon, func(), func(), *cluster.Mock, *mockEven
 		JobStatusCache: &job.StatusCache{Size: 100},
 		EventWriter:    events,
 		Logger:         logger,
-		LoopVars:       &LoopVars{},
+		LoopVars:       &LoopVars{GitTimeout: timeout},
 	}
 
 	start := func() {

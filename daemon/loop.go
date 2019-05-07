@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"github.com/weaveworks/flux/git"
 	"sync"
 	"time"
 
@@ -13,6 +14,8 @@ import (
 type LoopVars struct {
 	SyncInterval         time.Duration
 	RegistryPollInterval time.Duration
+	GitTimeout           time.Duration
+	GitVerifySignatures  bool
 
 	initOnce       sync.Once
 	syncSoon       chan struct{}
@@ -85,9 +88,18 @@ func (d *Daemon) Loop(stop chan struct{}, wg *sync.WaitGroup, logger log.Logger)
 		case <-syncTimer.C:
 			d.AskForSync()
 		case <-d.Repo.C:
-			ctx, cancel := context.WithTimeout(context.Background(), d.GitConfig.Timeout)
-			newSyncHead, invalidCommit, err := latestValidRevision(ctx, d.Repo, d.GitConfig)
+			var newSyncHead string
+			var invalidCommit git.Commit
+			var err error
+
+			ctx, cancel := context.WithTimeout(context.Background(), d.GitTimeout)
+			if d.GitVerifySignatures {
+				newSyncHead, invalidCommit, err = latestValidRevision(ctx, d.Repo, d.GitConfig)
+			} else {
+				newSyncHead, err = d.Repo.BranchHead(ctx)
+			}
 			cancel()
+
 			if err != nil {
 				logger.Log("url", d.Repo.Origin().URL, "err", err)
 				continue
@@ -95,6 +107,7 @@ func (d *Daemon) Loop(stop chan struct{}, wg *sync.WaitGroup, logger log.Logger)
 			if invalidCommit.Revision != "" {
 				logger.Log("err", "found invalid GPG signature for commit", "revision", invalidCommit.Revision, "key", invalidCommit.Signature.Key)
 			}
+
 			logger.Log("event", "refreshed", "url", d.Repo.Origin().URL, "branch", d.GitConfig.Branch, "HEAD", newSyncHead)
 			if newSyncHead != syncHead {
 				syncHead = newSyncHead
@@ -116,7 +129,7 @@ func (d *Daemon) Loop(stop chan struct{}, wg *sync.WaitGroup, logger log.Logger)
 				jobLogger.Log("state", "done", "success", "false", "err", err)
 			} else {
 				jobLogger.Log("state", "done", "success", "true")
-				ctx, cancel := context.WithTimeout(context.Background(), d.GitConfig.Timeout)
+				ctx, cancel := context.WithTimeout(context.Background(), d.GitTimeout)
 				err := d.Repo.Refresh(ctx)
 				if err != nil {
 					logger.Log("err", err)
