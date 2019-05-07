@@ -166,21 +166,43 @@ type lastKnownSyncTag struct {
 	warnedAboutChange bool
 }
 
-func (s *lastKnownSyncTag) Revision() string {
-	return s.revision
-}
-
-func (s *lastKnownSyncTag) SetRevision(oldRev, newRev string) {
+// SetRevision updates the sync tag revision in git _and_ the
+// in-memory revision, if it has changed. In addition, it validates
+// if the in-memory revision matches the old revision from git before
+// making the update, to notify a user about multiple Flux daemons
+// using the same tag.
+func (s *lastKnownSyncTag) SetRevision(ctx context.Context, working *git.Checkout, timeout time.Duration,
+	oldRev, newRev string) (bool, error) {
 	// Check if something other than the current instance of fluxd
 	// changed the sync tag. This is likely caused by another instance
 	// using the same tag. Having multiple instances fight for the same
 	// tag can lead to fluxd missing manifest changes.
 	if s.revision != "" && oldRev != s.revision && !s.warnedAboutChange {
 		s.logger.Log("warning",
-			"detected external change in git sync tag; the sync tag should not be shared by fluxd instances")
+			"detected external change in git sync tag; the sync tag should not be shared by fluxd instances",
+			"tag", s.syncTag)
 		s.warnedAboutChange = true
 	}
 
-	s.logger.Log("tag", s.syncTag, "old", oldRev, "new", newRev)
+	// Did it actually change?
+	if s.revision == newRev {
+		return false, nil
+	}
+
+	// Update the sync tag revision in git
+	tagAction := git.TagAction{
+		Revision: newRev,
+		Message:  "Sync pointer",
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	if err := working.MoveSyncTagAndPush(ctx, tagAction); err != nil {
+		return false, err
+	}
+	cancel()
+
+	// Update in-memory revision
 	s.revision = newRev
+
+	s.logger.Log("tag", s.syncTag, "old", oldRev, "new", newRev)
+	return true, nil
 }

@@ -17,9 +17,8 @@ import (
 	"github.com/weaveworks/flux/update"
 )
 
-type SyncTag interface {
-	Revision() string
-	SetRevision(oldRev, newRev string)
+type syncTag interface {
+	SetRevision(ctx context.Context, working *git.Checkout, timeout time.Duration, oldRev, newRev string) (bool, error)
 }
 
 type eventLogger interface {
@@ -34,7 +33,7 @@ type changeSet struct {
 }
 
 // Sync starts the synchronization of the cluster with git.
-func (d *Daemon) Sync(ctx context.Context, started time.Time, revision string, syncTag SyncTag) error {
+func (d *Daemon) Sync(ctx context.Context, started time.Time, revision string, syncTag syncTag) error {
 	// Checkout a working clone used for this sync
 	ctxt, cancel := context.WithTimeout(ctx, d.GitTimeout)
 	working, err := d.Repo.Clone(ctxt, d.GitConfig)
@@ -45,10 +44,8 @@ func (d *Daemon) Sync(ctx context.Context, started time.Time, revision string, s
 	defer working.Clean()
 
 	// Ensure we are syncing the given revision
-	if headRev, err := working.HeadRevision(ctx); err != nil {
+	if err := working.Checkout(ctx, revision); err != nil {
 		return err
-	} else if headRev != revision {
-		err = working.Checkout(ctx, revision)
 	}
 
 	// Retrieve change set of commits we need to sync
@@ -96,17 +93,14 @@ func (d *Daemon) Sync(ctx context.Context, started time.Time, revision string, s
 	}
 
 	// Move sync tag
-	if c.newTagRev != c.oldTagRev {
-		if err := moveSyncTag(ctx, c, d.GitTimeout, working); err != nil {
-			return err
-		}
-		syncTag.SetRevision(c.oldTagRev, c.newTagRev)
-		if err := refresh(ctx, d.GitTimeout, d.Repo); err != nil {
-			return err
-		}
+	if ok, err := syncTag.SetRevision(ctx, working, d.GitTimeout, c.oldTagRev, c.newTagRev); err != nil {
+		return err
+	} else if !ok {
+		return nil
 	}
 
-	return nil
+	err = refresh(ctx, d.GitTimeout, d.Repo)
+	return err
 }
 
 // getChangeSet returns the change set of commits for this sync,
@@ -347,20 +341,6 @@ func logCommitEvent(el eventLogger, c changeSet, serviceIDs flux.ResourceIDSet, 
 		logger.Log("err", err)
 		return err
 	}
-	return nil
-}
-
-// moveSyncTag moves the sync tag to the revision we just synced.
-func moveSyncTag(ctx context.Context, c changeSet, timeout time.Duration, working *git.Checkout) error {
-	tagAction := git.TagAction{
-		Revision: c.newTagRev,
-		Message:  "Sync pointer",
-	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	if err := working.MoveSyncTagAndPush(ctx, tagAction); err != nil {
-		return err
-	}
-	cancel()
 	return nil
 }
 
