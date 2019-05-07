@@ -17,18 +17,6 @@ import (
 	"github.com/weaveworks/flux/update"
 )
 
-// Sync holds the data we are working with during a sync.
-type Sync struct {
-	started   time.Time
-	logger    log.Logger
-	working   *git.Checkout
-	repo      *git.Repo
-	gitConfig git.Config
-	manifests cluster.Manifests
-	cluster   cluster.Cluster
-	eventLogger
-}
-
 type SyncTag interface {
 	Revision() string
 	SetRevision(oldRev, newRev string)
@@ -38,91 +26,82 @@ type eventLogger interface {
 	LogEvent(e event.Event) error
 }
 
-type changeset struct {
+type changeSet struct {
 	commits     []git.Commit
 	oldTagRev   string
 	newTagRev   string
 	initialSync bool
 }
 
-// NewSync initializes a new sync for the given revision.
-func (d *Daemon) NewSync(logger log.Logger, revision string) (Sync, error) {
-	s := Sync{
-		logger:      logger,
-		repo:        d.Repo,
-		gitConfig:   d.GitConfig,
-		manifests:   d.Manifests,
-		cluster:     d.Cluster,
-		eventLogger: d,
-	}
-
-	// checkout out a working clone used for this sync.
-	var err error
-	ctx, cancel := context.WithTimeout(context.Background(), s.gitConfig.Timeout)
-	s.working, err = s.repo.Clone(ctx, s.gitConfig)
+// Sync starts the synchronization of the cluster with git.
+func (d *Daemon) Sync(ctx context.Context, started time.Time, revision string, syncTag SyncTag) error {
+	// Checkout a working clone used for this sync
+	ctxt, cancel := context.WithTimeout(ctx, d.GitConfig.Timeout)
+	working, err := d.Repo.Clone(ctxt, d.GitConfig)
 	if err != nil {
-		return s, err
+		return err
 	}
 	cancel()
+	defer working.Clean()
 
-	if headRev, err := s.working.HeadRevision(context.Background()); err != nil {
-		return s, err
+	// Ensure we are syncing the given revision
+	if headRev, err := working.HeadRevision(ctx); err != nil {
+		return err
 	} else if headRev != revision {
-		err = s.working.Checkout(context.Background(), revision)
+		err = working.Checkout(ctx, revision)
 	}
 
-	return s, err
-}
-
-// Run starts the synchronization of the cluster with git.
-func (s *Sync) Run(ctx context.Context, synctag SyncTag) error {
-	s.started = time.Now().UTC()
-	defer s.working.Clean()
-
-	c, err := getChangeset(ctx, s.working, s.repo, s.gitConfig)
+	// Retrieve change set of commits we need to sync
+	c, err := getChangeSet(ctx, working, d.Repo, d.GitConfig.Timeout, d.GitConfig.Paths)
 	if err != nil {
 		return err
 	}
 
-	syncSetName := makeGitConfigHash(s.repo.Origin(), s.gitConfig)
-	resources, resourceErrors, err := doSync(s, syncSetName)
+	// Run actual sync of resources on cluster
+	syncSetName := makeGitConfigHash(d.Repo.Origin(), d.GitConfig)
+	resources, resourceErrors, err := doSync(d.Manifests, working, d.Cluster, syncSetName, d.Logger)
 	if err != nil {
 		return err
 	}
 
-	changedResources, err := getChangedResources(ctx, s, c, resources)
+	// Determine what resources changed during the sync
+	changedResources, err := getChangedResources(ctx, c, d.GitConfig, working, d.Manifests, resources)
 	serviceIDs := flux.ResourceIDSet{}
 	for _, r := range changedResources {
 		serviceIDs.Add([]flux.ResourceID{r.ResourceID()})
 	}
 
-	notes, err := getNotes(ctx, s)
+	// Retrieve git notes and collect events from them
+	notes, err := getNotes(ctx, d.GitConfig.Timeout, working)
 	if err != nil {
 		return err
 	}
-	noteEvents, includesEvents, err := collectNoteEvents(ctx, s, c, notes)
+	noteEvents, includesEvents, err := collectNoteEvents(ctx, c, notes, d.GitConfig.Timeout, working, started, d.Logger)
 	if err != nil {
 		return err
 	}
 
-	if err := logCommitEvent(s, c, serviceIDs, includesEvents, resourceErrors); err != nil {
+	// Report all synced commits
+	if err := logCommitEvent(d, c, serviceIDs, started, includesEvents, resourceErrors, d.Logger); err != nil {
 		return err
 	}
 
+	// Report all collected events
 	for _, event := range noteEvents {
-		if err = s.LogEvent(event); err != nil {
-			s.logger.Log("err", err)
+		if err = d.LogEvent(event); err != nil {
+			d.Logger.Log("err", err)
 			// Abort early to ensure at least once delivery of events
 			return err
 		}
 	}
 
+	// Move sync tag
 	if c.newTagRev != c.oldTagRev {
-		if err := moveSyncTag(ctx, s, c); err != nil {
+		if err := moveSyncTag(ctx, c, d.GitConfig.Timeout, working); err != nil {
 			return err
 		}
-		synctag.SetRevision(c.oldTagRev, c.newTagRev)
-		if err := refresh(ctx, s); err != nil {
+		syncTag.SetRevision(c.oldTagRev, c.newTagRev)
+		if err := refresh(ctx, d.GitConfig.Timeout, d.Repo); err != nil {
 			return err
 		}
 	}
@@ -130,10 +109,11 @@ func (s *Sync) Run(ctx context.Context, synctag SyncTag) error {
 	return nil
 }
 
-// getChangeset returns the changeset of commits for this sync,
+// getChangeSet returns the change set of commits for this sync,
 // including the revision range and if it is an initial sync.
-func getChangeset(ctx context.Context, working *git.Checkout, repo *git.Repo, gitConfig git.Config) (changeset, error) {
-	var c changeset
+func getChangeSet(ctx context.Context, working *git.Checkout, repo *git.Repo, timeout time.Duration,
+	paths []string) (changeSet, error) {
+	var c changeSet
 	var err error
 
 	c.oldTagRev, err = working.SyncRevision(ctx)
@@ -145,12 +125,12 @@ func getChangeset(ctx context.Context, working *git.Checkout, repo *git.Repo, gi
 		return c, err
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, gitConfig.Timeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	if c.oldTagRev != "" {
-		c.commits, err = repo.CommitsBetween(ctx, c.oldTagRev, c.newTagRev, gitConfig.Paths...)
+		c.commits, err = repo.CommitsBetween(ctx, c.oldTagRev, c.newTagRev, paths...)
 	} else {
 		c.initialSync = true
-		c.commits, err = repo.CommitsBefore(ctx, c.newTagRev, gitConfig.Paths...)
+		c.commits, err = repo.CommitsBefore(ctx, c.newTagRev, paths...)
 	}
 	cancel()
 
@@ -159,17 +139,18 @@ func getChangeset(ctx context.Context, working *git.Checkout, repo *git.Repo, gi
 
 // doSync runs the actual sync of workloads on the cluster. It returns
 // a map with all resources it applied and sync errors it encountered.
-func doSync(s *Sync, syncSetName string) (map[string]resource.Resource, []event.ResourceError, error) {
-	resources, err := s.manifests.LoadManifests(s.working.Dir(), s.working.ManifestDirs())
+func doSync(manifests cluster.Manifests, working *git.Checkout, clus cluster.Cluster, syncSetName string,
+	logger log.Logger) (map[string]resource.Resource, []event.ResourceError, error) {
+	resources, err := manifests.LoadManifests(working.Dir(), working.ManifestDirs())
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "loading resources from repo")
 	}
 
 	var resourceErrors []event.ResourceError
-	if err := fluxsync.Sync(syncSetName, resources, s.cluster); err != nil {
+	if err := fluxsync.Sync(syncSetName, resources, clus); err != nil {
 		switch syncerr := err.(type) {
 		case cluster.SyncError:
-			s.logger.Log("err", err)
+			logger.Log("err", err)
 			for _, e := range syncerr {
 				resourceErrors = append(resourceErrors, event.ResourceError{
 					ID:    e.ResourceID,
@@ -186,17 +167,18 @@ func doSync(s *Sync, syncSetName string) (map[string]resource.Resource, []event.
 
 // getChangedResources calculates what resources are modified during
 // this sync.
-func getChangedResources(ctx context.Context, s *Sync, c changeset, resources map[string]resource.Resource) (map[string]resource.Resource, error) {
+func getChangedResources(ctx context.Context, c changeSet, gitConfig git.Config, working *git.Checkout,
+	manifests cluster.Manifests, resources map[string]resource.Resource) (map[string]resource.Resource, error) {
 	if c.initialSync {
 		return resources, nil
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, s.gitConfig.Timeout)
-	changedFiles, err := s.working.ChangedFiles(ctx, c.oldTagRev)
+	ctx, cancel := context.WithTimeout(ctx, gitConfig.Timeout)
+	changedFiles, err := working.ChangedFiles(ctx, c.oldTagRev)
 	if err == nil && len(changedFiles) > 0 {
 		// We had some changed files, we're syncing a diff
 		// FIXME(michael): this won't be accurate when a file can have more than one resource
-		resources, err = s.manifests.LoadManifests(s.working.Dir(), changedFiles)
+		resources, err = manifests.LoadManifests(working.Dir(), changedFiles)
 	}
 	cancel()
 	if err != nil {
@@ -206,9 +188,9 @@ func getChangedResources(ctx context.Context, s *Sync, c changeset, resources ma
 }
 
 // getNotes retrieves the git notes from the working clone.
-func getNotes(ctx context.Context, s *Sync) (map[string]struct{}, error) {
-	ctx, cancel := context.WithTimeout(ctx, s.gitConfig.Timeout)
-	notes, err := s.working.NoteRevList(ctx)
+func getNotes(ctx context.Context, timeout time.Duration, working *git.Checkout) (map[string]struct{}, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	notes, err := working.NoteRevList(ctx)
 	cancel()
 	if err != nil {
 		return nil, errors.Wrap(err, "loading notes from repo")
@@ -221,7 +203,8 @@ func getNotes(ctx context.Context, s *Sync) (map[string]struct{}, error) {
 // of what other things this sync includes e.g., releases and
 // autoreleases, that we're already posting as events, so upstream
 // can skip the sync event if it wants to.
-func collectNoteEvents(ctx context.Context, s *Sync, c changeset, notes map[string]struct{}) ([]event.Event, map[string]bool, error) {
+func collectNoteEvents(ctx context.Context, c changeSet, notes map[string]struct{}, timeout time.Duration,
+	working *git.Checkout, started time.Time, logger log.Logger) ([]event.Event, map[string]bool, error) {
 	if len(c.commits) == 0 {
 		return nil, nil, nil
 	}
@@ -236,8 +219,8 @@ func collectNoteEvents(ctx context.Context, s *Sync, c changeset, notes map[stri
 			continue
 		}
 		var n note
-		ctx, cancel := context.WithTimeout(ctx, s.gitConfig.Timeout)
-		ok, err := s.working.GetNote(ctx, c.commits[i].Revision, &n)
+		ctx, cancel := context.WithTimeout(ctx, timeout)
+		ok, err := working.GetNote(ctx, c.commits[i].Revision, &n)
 		cancel()
 		if err != nil {
 			return nil, nil, errors.Wrap(err, "loading notes from repo")
@@ -257,7 +240,7 @@ func collectNoteEvents(ctx context.Context, s *Sync, c changeset, notes map[stri
 		// notes on an initial sync, since they (most likely)
 		// don't belong to us.
 		if c.initialSync {
-			s.logger.Log("warning", "no notes expected on initial sync; this repo may be in use by another fluxd")
+			logger.Log("warning", "no notes expected on initial sync; this repo may be in use by another fluxd")
 			return noteEvents, eventTypes, nil
 		}
 
@@ -268,7 +251,7 @@ func collectNoteEvents(ctx context.Context, s *Sync, c changeset, notes map[stri
 			noteEvents = append(noteEvents, event.Event{
 				ServiceIDs: n.Result.AffectedResources(),
 				Type:       event.EventRelease,
-				StartedAt:  s.started,
+				StartedAt:  started,
 				EndedAt:    time.Now().UTC(),
 				LogLevel:   event.LogLevelInfo,
 				Metadata: &event.ReleaseEventMetadata{
@@ -290,7 +273,7 @@ func collectNoteEvents(ctx context.Context, s *Sync, c changeset, notes map[stri
 			noteEvents = append(noteEvents, event.Event{
 				ServiceIDs: n.Result.AffectedResources(),
 				Type:       event.EventRelease,
-				StartedAt:  s.started,
+				StartedAt:  started,
 				EndedAt:    time.Now().UTC(),
 				LogLevel:   event.LogLevelInfo,
 				Metadata: &event.ReleaseEventMetadata{
@@ -312,7 +295,7 @@ func collectNoteEvents(ctx context.Context, s *Sync, c changeset, notes map[stri
 			noteEvents = append(noteEvents, event.Event{
 				ServiceIDs: n.Result.AffectedResources(),
 				Type:       event.EventAutoRelease,
-				StartedAt:  s.started,
+				StartedAt:  started,
 				EndedAt:    time.Now().UTC(),
 				LogLevel:   event.LogLevelInfo,
 				Metadata: &event.AutoReleaseEventMetadata{
@@ -338,18 +321,18 @@ func collectNoteEvents(ctx context.Context, s *Sync, c changeset, notes map[stri
 }
 
 // logCommitEvent reports all synced commits to the upstream.
-func logCommitEvent(s *Sync, c changeset, serviceIDs flux.ResourceIDSet,
-	includesEvents map[string]bool, resourceErrors []event.ResourceError) error {
+func logCommitEvent(el eventLogger, c changeSet, serviceIDs flux.ResourceIDSet, started time.Time,
+	includesEvents map[string]bool, resourceErrors []event.ResourceError, logger log.Logger) error {
 	cs := make([]event.Commit, len(c.commits))
 	for i, ci := range c.commits {
 		cs[i].Revision = ci.Revision
 		cs[i].Message = ci.Message
 	}
-	if err := s.LogEvent(event.Event{
+	if err := el.LogEvent(event.Event{
 		ServiceIDs: serviceIDs.ToSlice(),
 		Type:       event.EventSync,
-		StartedAt:  s.started,
-		EndedAt:    s.started,
+		StartedAt:  started,
+		EndedAt:    started,
 		LogLevel:   event.LogLevelInfo,
 		Metadata: &event.SyncEventMetadata{
 			Commits:     cs,
@@ -358,20 +341,20 @@ func logCommitEvent(s *Sync, c changeset, serviceIDs flux.ResourceIDSet,
 			Errors:      resourceErrors,
 		},
 	}); err != nil {
-		s.logger.Log("err", err)
+		logger.Log("err", err)
 		return err
 	}
 	return nil
 }
 
 // moveSyncTag moves the sync tag to the revision we just synced.
-func moveSyncTag(ctx context.Context, s *Sync, c changeset) error {
+func moveSyncTag(ctx context.Context, c changeSet, timeout time.Duration, working *git.Checkout) error {
 	tagAction := git.TagAction{
 		Revision: c.newTagRev,
 		Message:  "Sync pointer",
 	}
-	ctx, cancel := context.WithTimeout(ctx, s.gitConfig.Timeout)
-	if err := s.working.MoveSyncTagAndPush(ctx, tagAction); err != nil {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	if err := working.MoveSyncTagAndPush(ctx, tagAction); err != nil {
 		return err
 	}
 	cancel()
@@ -380,9 +363,9 @@ func moveSyncTag(ctx context.Context, s *Sync, c changeset) error {
 
 // refresh refreshes the repository, notifying the daemon we have a new
 // sync head.
-func refresh(ctx context.Context, s *Sync) error {
-	ctx, cancel := context.WithTimeout(ctx, s.gitConfig.Timeout)
-	err := s.repo.Refresh(ctx)
+func refresh(ctx context.Context, timeout time.Duration, repo *git.Repo) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	err := repo.Refresh(ctx)
 	cancel()
 	return err
 }

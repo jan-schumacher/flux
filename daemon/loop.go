@@ -73,15 +73,11 @@ func (d *Daemon) Loop(stop chan struct{}, wg *sync.WaitGroup, logger log.Logger)
 				default:
 				}
 			}
-			sync, err := d.NewSync(logger, syncHead)
-			if err != nil {
-				logger.Log("err", err)
-				continue
-			}
-			err = sync.Run(context.Background(), lastKnownSyncTag)
+			started := time.Now().UTC()
+			err := d.Sync(context.Background(), started, syncHead, lastKnownSyncTag)
 			syncDuration.With(
 				fluxmetrics.LabelSuccess, fmt.Sprint(err == nil),
-			).Observe(time.Since(sync.started).Seconds())
+			).Observe(time.Since(started).Seconds())
 			if err != nil {
 				logger.Log("err", err)
 			}
