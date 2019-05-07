@@ -323,6 +323,9 @@ func collectNoteEvents(ctx context.Context, c changeSet, notes map[string]struct
 // logCommitEvent reports all synced commits to the upstream.
 func logCommitEvent(el eventLogger, c changeSet, serviceIDs flux.ResourceIDSet, started time.Time,
 	includesEvents map[string]bool, resourceErrors []event.ResourceError, logger log.Logger) error {
+	if len(c.commits) == 0 {
+		return nil
+	}
 	cs := make([]event.Commit, len(c.commits))
 	for i, ci := range c.commits {
 		cs[i].Revision = ci.Revision
